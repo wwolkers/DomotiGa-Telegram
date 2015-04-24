@@ -1,0 +1,557 @@
+' Gambas class file
+
+' Description:
+' JsonRpcFunction.class
+
+' Development Status:
+' Finished
+
+' DomotiGa - an open source home automation program.
+' Copyright (C) Ron Klinkien, The Netherlands.
+
+' Read file called COPYING for license details.
+
+'***************************************************************************
+Export
+
+'~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+' Public variables
+'~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Property URL As String
+Property Method As String
+Property Params As JSONCollection
+Property Async As Boolean
+Property Id As Integer
+Property User As String
+Property Password As String
+Property TimeOut As Integer
+Property Protocol As Integer ' 0=HTTP, 1=RAW TCP
+Property Reply As Variant ' Holds the response if Async=False
+Property ErrorMsg As String ' Holds the error message if Async=False
+
+'~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+' Private variables
+'~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Private hHttpClient As HttpClient
+Private hRawClient As Socket
+Private $sMethod As String
+Private $cParams As New JSONCollection
+Private $sURL As String
+Private $bAsync As Boolean
+Private $iId As Integer
+Private $sUser As String
+Private $sPassword As String
+Private $iProtocol As Integer = 0
+Private $iTimeOut As Integer = 10
+Private $vReply As Variant
+Private $sErrorMsg As String
+Private sBuffer As String
+
+'~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+' Events to be raised
+'~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Event Reply(Data As Variant)
+Event BadReply(Code As String)
+
+'~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+' Called when Object is created - we take method name
+'~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Public Sub _New(NewMethod As String)
+
+  $sMethod = NewMethod
+
+End
+
+'~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+' Validate/Check the RAW TCP data for a JSON string
+' We count the { and } to "known" if it is one
+'~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Private Sub ValidateRawJson(sJson As String) As Boolean
+
+  Dim iCount As Integer
+  Dim iLeft, iRight As Integer
+  Dim sLast, sCurrent As String
+  Dim bStr As Boolean
+
+  For iCount = 1 To Len(sJson) + 1
+    sCurrent = Mid(sJson, iCount, 1)
+    If sCurrent = "\"" Then
+      If sLast <> "\\" Then bStr = Not bStr
+    Else
+      If Not bStr Then
+        If sCurrent = "{" Then Inc iLeft
+        If sCurrent = "}" Then Inc iRight
+      Endif
+    Endif
+
+    sLast = sCurrent
+  Next
+
+  ' If no { or }, then it is an invalid string
+  If iLeft = 0 Then Return False
+
+  ' If they are equal count, return true
+  If iLeft = iRight Then
+    Return True
+  Else
+    Return False
+  Endif
+
+End
+
+'~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+' Do the HttpClient Post OR RAW TCP Send now
+'~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Public Function Call(cParams As JSONCollection) As Boolean
+
+  Dim cJsonData As New JSONCollection
+  Dim sJsonData As String
+  Dim sBuf As String
+  Dim sHost As String
+  Dim iPort As Integer
+  Dim iSteps As Integer
+  Dim iCount As Integer
+
+' pass real result in a different parameter back like
+' authentication !
+
+  ' Store the parameters for later error handling
+  $cParams = cParams
+
+  If Not $sMethod Then
+    Error.Raise("Invalid Method")
+    Return False
+  Endif
+
+  If Not $sURL Then
+    Error.Raise("Invalid URL")
+    Return False
+  Endif
+
+  ' If the id isn't known yet, generate a new one
+  If Not $iId Then
+    Randomize
+    $iId = Int(Rnd(1, 32768))
+  Endif
+
+  ' Build up the JSON-RPC request
+  cJsonData.Add("2.0", "jsonrpc")
+  cJsonData.Add($sMethod, "method")
+  If cParams <> Null Then
+    cJsonData.Add(cParams, "params")
+  Endif
+  cJsonData.Add($iId, "id")
+
+  sJsonData = JSON.Encode(cJsonData)
+
+  ' Handle the Client request via HTTP
+  If $iProtocol = 0 Then
+
+    If hHttpClient Then
+      If hHttpClient.Status > 0 Then
+        Error.Raise("Still active")
+        Return False
+      Endif
+    Endif
+
+    hHttpClient = New HttpClient As "hHttpClient"
+
+    hHttpClient.URL = $sURL
+    hHttpClient.Async = $bAsync
+    hHttpClient.TimeOut = $iTimeOut
+
+    ' Set authentication if user & password are set
+    If $sUser And If $sPassword Then
+      hHttpClient.Auth = Net.AuthBasic
+      hHttpClient.User = $sUser
+      hHttpClient.Password = $sPassword
+    Endif
+
+    ' Also store method & id for Async calls
+    hHttpClient.Tag = $sMethod & "|" & $iId
+
+    ' Post the json data
+    hHttpClient.Post("application/json", sJsonData)
+
+    ' If Async = False, read the data
+    If Not $bAsync Then
+      ' Check if we got an error
+      ' True - no error - place return values in JSONCollection
+      ' False - an error
+
+      ' Make variables empty
+      sJsonData = ""
+      cJsonData.Clear()
+
+      ' Status needs to be positive
+      If hHttpClient.Status < 0 Then
+        $sErrorMsg = Log.CURL_Error_To_Text(hHttpClient.Status)
+        Return False
+      Endif
+
+      ' We only accept HTTP 200
+      If hHttpClient.Code <> 200 Then
+        $sErrorMsg = Log.HTTP_Error_To_Text(hHttpClient.Code) & " Not Supported"
+        Return False
+      Endif
+
+      ' Async = False, so we read the data
+      Try Read #hHttpClient, sJsonData, Lof(hHttpClient)
+
+    Else
+      ' If Async, always return True
+      Return True
+    Endif
+  Endif
+
+  ' Handle the Client request via RAW TCP
+  If $iProtocol = 1 Then
+
+    If hRawClient Then
+      If hRawClient.Status > 0 Then
+        Error.Raise("Still active")
+        Return False
+      Endif
+    Endif
+
+    ' Now find host and port to connect to
+    If InStr($sURL, ":") >= 1 Then
+      sHost = Mid($sURL, 1, InStr($sURL, ":") - 1)
+      Try iPort = CInt(Mid($sURL, InStr($sURL, ":") + 1))
+      If Error Then
+        Error.Raise("URL doesn't contain a valid numeric port")
+        Return False
+      Endif
+    Else
+      Error.Raise("URL doesn't contain host:port")
+      Return False
+    Endif
+
+    hRawClient = New Socket As "hRawClient"
+
+    hRawClient.Connect(sHost, iPort)
+
+    Do While (hRawClient.Status <> Net.Connected) And (hRawClient > 0)
+      Wait 0.1
+    Loop
+
+    If hRawClient.Status <> Net.Connected Then
+      ' TODO: better error handling
+      Return False
+    Endif
+
+    ' Also store method & id for Async calls
+    hRawClient.Tag = $sMethod & "|" & $iId
+
+    ' Write the data to the RAW TCP socket
+    Try Write #hRawClient, sJsonData, Len(sJsonData)
+
+    ' If Async = False, read the data
+    If Not $bAsync Then
+      ' Check if we got an error
+      ' True - no error - place return values in JSONCollection
+      ' False - an error
+
+      ' Make variables empty
+      sJsonData = ""
+      cJsonData.Clear()
+
+      ' Try to read a response
+      iSteps = $iTimeOut / 0.005
+      For iCount = 1 To iSteps Step 1
+        Try Read #hRawClient, sBuf, Lof(hRawClient)
+        sJsonData &= sBuf
+        If ValidateRawJson(sJsonData) Then Break
+        Wait 0.005
+      Next
+
+      ' Close socket
+      Try Close #hRawClient
+
+    Else
+      ' If Async, always return True
+      Return True
+    Endif
+
+  Endif
+
+  ' We got some JSON data, no process it
+  If Not sJsonData Then
+    $sErrorMsg = "No data received"
+    Return False
+  Endif
+
+  ' Try to decode JSON
+  Try cJsonData = JSON.Decode(sJsonData, True)
+  If Error Then
+    $sErrorMsg = "Error while decoding JSON"
+    Return False
+  Endif
+
+  ' Valid JSON data, check if it is JSON-RPC
+  If cJsonData["jsonrpc"] <> "2.0" Then
+    $sErrorMsg = "Request doesn't have a jsonrpc=2.0 header"
+    Return False
+  Endif
+
+  ' Check if the id is the same
+  If cJsonData["id"] <> $iId Then
+    $sErrorMsg = "Wrong or invalid JSON-RPC id is returned"
+    Return False
+  Endif
+
+  ' Check for an error - also we got a 'code' and 'message'
+  If cJsonData.Exist("error") Then
+    Try $sErrorMsg = "JSON Response: " & cJsonData["error"]["message"] & " (" & cJsonData["error"]["code"] & ")"
+    Return False
+  Endif
+
+  ' No error - we got valid data
+  $vReply = cJsonData["result"]
+  Return True
+
+End
+
+'~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+' When a HTTP error happens, raise an event when using Async mode
+'~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Public Sub hHttpClient_Error()
+
+  If $bAsync Then
+    Raise BadReply(Log.CURL_Error_To_Text(hHttpClient.Status))
+  Endif
+
+End
+
+'~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+'
+'~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Public Sub hHttpClient_Read()
+
+  Dim sCad As String
+
+  ' If seems to be a bogus request, read the data and return
+  If Not $bAsync Then
+    Try Read #hHttpClient, sCad, Lof(hHttpClient)
+    Return
+  Endif
+
+  Try Read #hHttpClient, sCad, Lof(hHttpClient)
+  If Not Error Then sBuffer &= sCad
+
+End
+
+'~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+'
+'~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Public Sub hHttpClient_Finished()
+
+  Dim sCad As String
+  Dim cJsonData As New JSONCollection
+  Dim sJsonData As String
+  Dim aStr As New String[]
+
+  ' If seems to be a bogus request, read the data and return
+  If Not $bAsync Then
+    Try Read #hHttpClient, sCad, Lof(hHttpClient)
+    Return
+  Endif
+
+  ' We only accept HTTP 200
+  If hHttpClient.Code <> 200 Then
+    Raise BadReply(Log.HTTP_Error_To_Text(hHttpClient.Code) & " Not Supported")
+    Return
+  Endif
+
+  Try Read #hHttpClient, sCad, Lof(hHttpClient)
+  If Not Error Then sBuffer &= sCad
+
+  sJsonData = sBuffer
+
+  If Not sJsonData Then
+    Raise BadReply("No data received")
+    Return
+  Endif
+
+  ' Get id from the tag field. 0=Method, 1=id
+  aStr = Scan(hHttpClient.Tag, "*|*")
+
+  ' Try to decode JSON
+  Try cJsonData = JSON.Decode(sJsonData, True)
+  If Error Then
+    Raise BadReply("Failed to decode JSON")
+    Return
+  Endif
+
+  ' Valid JSON data, check if it is JSON-RPC
+  If cJsonData["jsonrpc"] <> "2.0" Then
+    Raise BadReply("No JSON-RPC 2.0 format")
+    Return
+  Endif
+
+    ' Check if the id is the same
+  If cJsonData["id"] <> aStr[1] Then 
+    Raise BadReply("Invalid id return")
+    Return
+  Endif
+
+  ' Check for an error
+  If cJsonData.Exist("error") Then
+    Raise BadReply("Error from JSON-RPC 2.0 server")
+    Return
+  Endif
+
+  ' No error - we got valid data
+  $vReply = cJsonData["result"]
+  Raise Reply($vReply)
+
+End
+
+'~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+' Properties
+'~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Sub URL_Write(NewURL As String)
+
+  If hHttpClient Then
+    If hHttpClient.Status > 0 Then
+      Error.Raise("Still active")
+      Return
+    Endif
+  Endif
+
+  $sURL = Trim(NewURL)
+
+End
+
+Function URL_Read() As String
+
+  Return $sURL
+
+End
+
+Function Method_Write(NewMethod As String)
+
+  $sMethod = NewMethod
+
+End
+
+Function Method_Read() As String
+
+  Return $sMethod
+
+End
+
+Function Async_Write(NewAsync As Boolean)
+
+  $bAsync = NewAsync
+
+End
+
+Function Async_Read() As Boolean
+
+  Return $bAsync
+
+End
+
+Function Id_Write(NewId As Integer)
+
+  If NewId >= 1 Then
+    $iId = NewId
+  Else
+    ' If number is negative or zero, generate one ourself
+    Randomize
+    $iId = Int(Rnd(1, 32768))
+  Endif
+
+End
+
+Function Id_Read() As Integer
+
+  Return $iId
+
+End
+
+Function User_Write(NewUser As String)
+
+  $sUser = NewUser
+
+End
+
+Function User_Read() As String
+
+  Return $sUser
+
+End
+
+Function Password_Write(NewPassword As String)
+
+  $sPassword = NewPassword
+
+End
+
+Function Password_Read() As String
+
+  Return $sPassword
+
+End
+
+Function Reply_Read() As Variant
+
+  Return $vReply
+
+End
+
+Function Reply_Write(vReply As Variant)
+
+  $vReply = vReply
+
+End
+
+Function ErrorMsg_Read() As String
+
+  Return $sErrorMsg
+
+End
+
+Function ErrorMsg_Write(sErrorMsg As String)
+
+  $sErrorMsg = sErrorMsg
+
+End
+
+Function Protocol_Read() As Integer
+
+  Return $iProtocol
+
+End
+
+Function Protocol_Write(iProtocol As Integer)
+
+  $iProtocol = iProtocol
+
+End
+
+Function TimeOut_Read() As Integer
+
+  Return $iTimeOut
+
+End
+
+Function TimeOut_Write(iTimeOut As Integer)
+
+  $iTimeOut = iTimeOut
+
+End
+
+Function Params_Read() As JSONCollection
+
+  Return $cParams
+
+End
+
+Function Params_Write(cParams As JSONCollection)
+
+  $cParams = cParams
+
+End
+

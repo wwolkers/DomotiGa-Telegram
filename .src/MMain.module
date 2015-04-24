@@ -1,0 +1,371 @@
+' Gambas module file
+
+Private hTelegramCLI As Process
+Private sHouseMode As String
+Private LogLabel As String = "[Telegram]"
+
+Public AllowedContacts As String[]
+Public $bDebug As Boolean = True
+Public $sURL As String = "localhost:9090"
+
+Public Sub Main()
+AllowedContacts = ["Wouter_Wolkers"]
+sHouseMode = "normal"
+
+hTelegramCLI = Exec ["/home/cubie/tg/bin/telegram-cli", "-EC"] For Input Output As "TelegramCLI"
+
+End
+
+'~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+' read telegram-cli output
+'~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Public Sub TelegramCLI_Read()
+
+  Dim sBuffer, sContact As String
+  Dim rMatch As RegExp
+  Dim allowCount, i As Integer
+
+  sBuffer = Read #Last, -256
+  Print "Buffer: " & sBuffer
+    
+  ' Match that the line is in format:
+  ' [HH:MM]  Contact Name >>> Message
+  rMatch = New RegExp(sBuffer, "\\[([0-9]|0[0-9]|1[0-9]|2[0-3]):([0-5][0-9])\\](.*)(>>>)(.*)")
+  If rMatch.Count > 0 Then
+'    Print Int(rMatch.Count) & " Matches"
+'    For i = 1 To rMatch.Count
+'      Print i & " " & rMatch[i].text
+'    Next
+    sContact = Replace$(Trim$(rMatch[3].text), " ", "_")    
+    Print "Contact: " & sContact
+    For allowCount = 0 To (AllowedContacts.Count - 1)
+      If AllowedContacts[allowCount] = sContact Then
+        Print "Allowed contact, parsing message " & rMatch[5].text
+        If Comp(Trim(LCase(rMatch[5].Text)), "server status") = 0 Then
+            Write #hTelegramCLI, "msg " & sContact & " \"" &
+            "DomotiGa " & GetProgramVersion() & " Status: running " & GetProgramUptime() & "\\n" &
+            "Cubie running on mains power, 4.838V and using 0.343A\"\r\n"
+        Endif
+        If Comp(Left$(Trim(LCase(rMatch[5].Text)), 9), "housemode") = 0 Then
+          If Len(Trim(LCase(rMatch[5].Text))) > 9 Then
+            ' got a command, let's set it to string.
+            ' FIXME: should check that it's a valid housemode
+            sHouseMode = Right$(Trim(LCase(rMatch[5].Text)), Len(Trim(LCase(rMatch[5].Text))) - 10)
+            SetHouseMode(sHouseMode)
+          Endif
+            sBuffer = 
+            "msg Wouter_Wolkers \"" &
+            "DomotiGa housemode: " & GetHouseMode() & "\"\r\n"
+            Write #hTelegramCLI, sBuffer
+        Endif
+        
+      Endif
+    Next
+    Write #hTelegramCLI, "mark_read Wouter_Wolkers\r\n"
+  Endif
+  
+Catch
+  Print (LogLabel & "ERROR: '" & Error.Text & "' at '" & Error.Where & ")")
+
+End
+
+
+'~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+' Generic JSON RPC Client procedure
+'~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Public Function Call_JsonRpcClient(sMethod As String, bAsync As Boolean, cData As JSONCollection) As Variant
+
+  Dim cRpc As JsonRpcClient
+  Dim bOk As Boolean
+
+  If $bDebug Then Print (LogLabel & "Method=" & sMethod)
+
+  cRpc = New JsonRpcClient(sMethod) As "cRpc"
+  cRpc.URL = $sURL
+  cRpc.Async = bAsync
+  bOk = cRpc.Call(cData)
+
+  ' If Async = True then just check we got bOk, then the call start successfully
+  ' If Async = False then we need to check bOk and then the Reply variable for the information
+  If bAsync Then
+    If Not bOk Then
+      Print (LogLabel & "ERROR: Method: '" & cRpc.Method & "' returned '" & cRpc.ErrorMsg & "'.")
+      Return
+    Endif
+  Else
+    If bOk Then
+      Return Process_JsonRpc_Reply(cRpc, cRpc.Reply)
+    Else
+      Print (LogLabel & "ERROR: '" & cRpc.ErrorMsg & "' when posting to URL '" & cRpc.URL & "'. Method: '" & cRpc.Method & "'.")
+      Return Null
+    Endif
+  Endif
+
+Catch
+  Print (LogLabel & "ERROR: '" & Error.Text & "' at '" & Error.Where & "', when posting to URL '" & cRpc.URL & "'. Method: '" & cRpc.Method & "'")
+
+End
+
+Public Sub cRpc_Reply(vReply As Variant)
+
+  Process_JsonRpc_Reply(Last, vReply)
+
+End
+
+Public Sub cRpc_BadReply(sText As String)
+
+  Print (LogLabel & "ERROR: '" & sText & "' when posting to URL '" & Last.URL & "'. Method: '" & Last.Method & "'.")
+
+End
+
+'~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+' Process response for almost all methods
+'~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Private Sub Process_JsonRpc_Reply(cRpc As Object, vReply As Variant) As Variant
+
+'  Dim vValue As Variant
+
+  Select cRpc.Method
+    Case "domotiga.uptime"
+      Return vReply["uptime_str"]
+
+    Case "plugin.restart"
+      If vReply Then
+        Print (LogLabel & "Successfully (re)started plugin on server.")
+      Else
+        Print (LogLabel & "ERROR: There was a problem (re)starting plugin on server, check it's log.")
+      Endif
+
+    Case "housemode.get"
+      Return vReply["mode"]
+      
+    Case "housemode.set"
+      If vReply Then
+        If cRpc.Params["mode"] Then
+          Print (LogLabel & "Successfully set House mode to '" & cRpc.Params["mode"] & "'.")
+        Else
+          Print (LogLabel & "Successfully set Mute mode to '" & IIf(cRpc.Params["mute"], "Audio Disabled", "Audio Enabled") & "'.")
+        Endif
+      Else
+        If cRpc.Params["mode"] Then
+          Print (LogLabel & "ERROR: There was a problem setting House mode to '" & cRpc.Params["mode"] & "'.")
+        Else
+          Print (LogLabel & "ERROR: There was a problem setting Mute mode to '" & cRpc.Params["mute"] & "'.")
+        Endif
+      Endif
+
+    Case "email.send"
+      If vReply Then
+        Print (LogLabel & "Successfully sent e-mail to '" & cRpc.Params["to"] & "'.")
+      Else
+        Print (LogLabel & "ERROR: There was a problem sending e-mail to " & cRpc.Params["to"] & ".")
+      Endif
+
+    Case "twitter.send"
+      If vReply Then
+        Print (LogLabel & "Successfully sent tweet.")
+      Else
+        Print (LogLabel & "ERROR: There was a problem sending tweet.")
+      Endif
+
+    Case "sms.send"
+      If vReply Then
+        Print (LogLabel & "Successfully sent SMS to '" & cRpc.Params["to"] & "'.")
+      Else
+        Print (LogLabel & "ERROR: There was a problem sending SMS to '" & cRpc.Params["to"] & "'.")
+      Endif
+
+    Case "device.set"
+      If Not vReply Then Print (LogLabel & "ERROR: There was a problem setting value of device!")
+
+    Case "sound.play"
+      If Not vReply Then Print (LogLabel & "ERROR: There was a problem playing sound.")
+
+    Case "voicetext.play"
+      If Not vReply Then Print (LogLabel & "ERROR: There was a problem speaking voicetext.")
+
+    Case "serverstat.update"
+      If Not vReply Then Print (LogLabel & "ERROR: There was a problem updating serverstats graphs.")
+
+    Case "rrdtool.create"
+        If Not vReply Then Print (LogLabel & "ERROR: There was a problem creating rrdtool databases.")
+    Case "rrdtool.update"
+      If Not vReply Then Print (LogLabel & "ERROR: There was a problem updating rrdtool graphs.")
+    Case "rrdtool.generate"
+      If Not vReply Then Print (LogLabel & "ERROR: There was a problem generating the rrdtool graph.")
+    Case "rrdtool.deleterrd"
+      If Not vReply Then Print (LogLabel & "ERROR: There was a problem deleting the rrd file(s).")
+
+    Case "dsc.setpin"
+      If vReply Then
+        Print (LogLabel & "Successfully set DSC Alarm pin.")
+      Else
+        Print (LogLabel & "ERROR: There was a problem setting DSC Alarm pin.")
+      Endif
+    Case "dsc.setalarm"
+      If vReply Then
+        Print (LogLabel & "Successfully set DSC Alarm mode.")
+      Else
+        Print (LogLabel & "ERROR: There was a problem setting DSC Alarm mode.")
+      Endif
+
+    Case "ledmatrix.display"
+      If Not vReply Then Print (LogLabel & "ERROR: There was a problem displaying LEDMatrix message.")
+
+    Case "avcontrol.get"
+      If Not vReply Then Print (LogLabel & "ERROR: There was a problem controlling audio/video device '" & cRpc.Params["model"] & "' with '" & cRpc.Params["cmd"] & "'.")
+
+    Case "avcontrol.set"
+      If Not vReply Then Print (LogLabel & "ERROR: There was a problem getting audio/video device settngs '" & cRpc.Params["model"] & "' with '" & cRpc.Params["cmd"] & "'.")
+
+    Case "cul.simulate"
+      If Not vReply Then Print (LogLabel & "ERROR: There was a problem simulating CUL packet '" & cRpc.Params["data"] & "'.")
+
+    Case "cul.queuecommand"
+      If Not vReply Then Print (LogLabel & "ERROR: There was a problem queueing CUL command '" & cRpc.Params["cmd"] & "'.")
+
+    Case "event.run"
+      If vReply Then
+        Print (LogLabel & "Successfully executed actions from event with id '" & cRpc.Params["event_id"] & "'.")
+      Else
+        Print (LogLabel & "ERROR: There was a problem executing actions from event with id '" & cRpc.Params["event_id"] & "'.")
+      Endif
+
+    Case "action.run"
+      If vReply Then
+        Print (LogLabel & "Successfully executed action with id '" & cRpc.Params["action_id"] & "'.")
+      Else
+        Print (LogLabel & "ERROR: There was a problem executing action with id '" & cRpc.Params["action_id"] & "'.")
+      Endif
+
+    Case "squeezebox.set"
+      If vReply Then
+        Select cRpc.Params["function"]
+          Case "volume"
+            Print (LogLabel & "Successfully set volume player '" & cRpc.Params["player"] & "'.")
+          Case "startplayer"
+            Print (LogLabel & "Successfully set play player '" & cRpc.Params["player"] & "'.")
+          Case "stopplayer"
+            Print (LogLabel & "Successfully set stop player '" & cRpc.Params["player"] & "'.")
+          Case "nextnumber"
+            Print (LogLabel & "Successfully set next number player '" & cRpc.Params["player"] & "'.")
+          Case "prevnumber"
+            Print (LogLabel & "Successfully set prev number player '" & cRpc.Params["player"] & "'.")
+          Case "clearplaylist"
+            Print (LogLabel & "Successfully set clear playlist player '" & cRpc.Params["player"] & "'.")
+          Case "addalbumtoplaylist"
+            Print (LogLabel & "Successfully set add album to playlist player '" & cRpc.Params["player"] & "'.")
+        End Select
+      Else
+        Select cRpc.Params["function"]
+          Case "volume"
+            Print (LogLabel & "ERROR: There was a problem to set volume player '" & cRpc.Params["player"] & "'.")
+          Case "startplayer"
+            Print (LogLabel & "ERROR: There was a problem to set play player '" & cRpc.Params["player"] & "'.")
+          Case "stopplayer"
+            Print (LogLabel & "ERROR: There was a problem to set stop player '" & cRpc.Params["player"] & "'.")
+          Case "nextnumber"
+            Print (LogLabel & "ERROR: There was a problem to set next number player '" & cRpc.Params["player"] & "'.")
+          Case "prevnumber"
+            Print (LogLabel & "ERROR: There was a problem to set prev number player '" & cRpc.Params["player"] & "'.")
+          Case "clearplaylist"
+            Print (LogLabel & "ERROR: There was a problem to clear playlistplayer '" & cRpc.Params["player"] & "'.")
+          Case "addalbumtoplaylist"
+            Print (LogLabel & "ERROR: There was a problem to add a ablum to playlist player '" & cRpc.Params["player"] & "'.")
+        End Select
+      Endif
+    Case "squeezebox.get"
+    'Print (LogLabel & "Successfully get current artist player '" & sPlayerId & "'.")
+    'Print (LogLabel & "ERROR: There was a problem to get current artist player '" & sPlayerId & "'.")
+    'Print (LogLabel & "Successfully player is connected to server player id '" & sPlayerId & "'.")
+    'Print (LogLabel & "ERROR: There was a problem to get player is connected to server player id '" & sPlayerId & "'.")
+
+    Case "thermostat.derogateheating"
+      If Not vReply Then Print (LogLabel & "ERROR: There was a problem derogating heating.")
+
+    Case "cmdr.plcbus.txcommand"
+      If Not vReply Then Print (LogLabel & "ERROR: There was a problem sending PLCBUS command for '" & cRpc.Params["address"] & "'.")
+
+  End Select
+
+  Return vReply
+
+End
+
+'~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+' Retrieve program version from the server
+'~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Public Function GetProgramVersion() As String
+Dim sResult As String
+
+  sResult = Call_JsonRpcClient("domotiga.version", False, Null)
+  If sResult <> 0 Then
+    Return sResult
+  Endif
+  
+  Return False
+
+End
+
+'~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+' Retrieve program uptime from the server
+'~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Public Function GetProgramUptime() As String
+Dim sResult As String
+
+  sResult = Call_JsonRpcClient("domotiga.uptime", False, Null)
+  If sResult <> 0 Then
+    Return sResult
+  Endif
+  
+  Return "Uptime Unknown"
+
+End
+
+'~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+' Get housemode
+'~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Public Function GetHouseMode() As String
+
+  Return Call_JsonRpcClient("housemode.get", False, cData)
+
+End
+
+'~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+' Set housemode
+'~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Public Function SetHouseMode(sMode As String)
+
+  Dim cData As New JSONCollection
+
+  cData.Add(sMode, "mode")
+  Call_JsonRpcClient("housemode.set", False, cData)
+
+End
+
+'~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+' Restart Plugin
+'~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Public Sub Plugin_Restart(sPlugin As String, Optional iInstance As Integer = 1)
+
+  Dim cData As New JSONCollection
+
+  cData.Add(sPlugin, "name")
+  cData.Add(iInstance, "instance_id")
+  Call_JsonRpcClient("plugin.restart", True, cData)
+
+End
+
+'~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+' Get all global variables
+' True=Call was successfull, False=An error occured
+'~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Public Function GetGlobalVars() As Boolean
+
+  If Call_JsonRpcClient("globalvar.list", False, Null) Then
+    Return True
+  Else
+    Return False
+  Endif
+
+End
